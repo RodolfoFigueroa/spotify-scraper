@@ -1,0 +1,6 @@
+*.csv
+backups/
+node_modules/
+.ipynb_checkpoints/
+.env
+.eslintrc.json
