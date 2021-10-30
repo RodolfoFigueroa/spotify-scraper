@@ -1,40 +1,62 @@
 import SpotifyWebApi from 'spotify-web-api-node';
 import fs from 'fs';
 import stringify from 'csv-stringify';
-import parse from 'csv-parse/lib/sync.js';
+import parse from 'csv-parse';
 
 class MySpotify extends SpotifyWebApi {
-    constructor(options) {
+    constructor(query_callback, response_callback, options) {
         super(options);
         this.processed = 0;
         this.write_stream = null;
 
-        this.response_callback = Function.prototype();
-        this.query_callback = Function.prototype();
+        this.response_callback = response_callback;
+        this.query_callback = query_callback;
     }
 
     async login() {
-        try {
-            const data = await this.clientCredentialsGrant();
-            this.setAccessToken(data.body['access_token']);
-            this.setRefreshToken(data.body['refresh-token']);
-        }
-        catch (error) {
-            console.log('Couldn\'t login.');
-        }
+        const data = await this.clientCredentialsGrant();
+        this.setAccessToken(data.body['access_token']);
+        this.setRefreshToken(data.body['refresh-token']);
     }
 
-    async refresh() {
-        try {
-            const data = await this.refreshAccessToken();
-            this.setAccessToken(data.body['access_token']);
+    async init_path(write_path, headers, options = null) {
+        const { read_path, row_callback, after_callback, pending } = options;
+        if (read_path) {
+            if (!fs.existsSync(read_path)) {
+                throw 'Read file doesn\'t exist.';
+            }
+            const rows = [];
+            await new Promise((resolve, reject) => {
+                fs.createReadStream(read_path)
+                    .pipe(parse({ delimiter: ',', columns: true }))
+                    .on('data', row => {
+                        rows.push(row_callback(row));
+                    })
+                    .on('end', resolve)
+                    .on('error', reject);
+            });
+
+            if (after_callback) {
+                this.queue = after_callback(rows);
+            }
+            else {
+                this.queue = rows;
+            }
+            if (pending) {
+                this.queue = this.queue.slice(0, pending);
+            }
         }
-        catch (error) {
-            console.log(error);
-        }
+
+        const stream = fs.createWriteStream(write_path, { flags: 'a' });
+        this.write_stream = stringify({
+            columns: headers,
+            header: true,
+            cast: { boolean: x => (+x).toString() },
+        });
+        this.write_stream.pipe(stream);
     }
 
-    async process_queue() {
+    async consume_queue() {
         while (this.queue.length > 0) {
             const popped = this.queue.pop();
             let response;
@@ -49,6 +71,10 @@ class MySpotify extends SpotifyWebApi {
                 else if (error.statusCode == 401) {
                     this.login();
                 }
+                else if (error.statusCode == 400) {
+                    console.log(popped);
+                    console.log(error.body);
+                }
                 else {
                     console.log(error);
                 }
@@ -56,273 +82,34 @@ class MySpotify extends SpotifyWebApi {
                 continue;
             }
 
-            await this.response_callback(response, popped);
-            process.stdout.write(`Processed: ${this.processed}. Pending: ${this.queue.length}\r`);
+            if (!response) {
+                continue;
+            }
+
+            const [ to_write, to_push ] = await this.response_callback(response, popped);
+            to_write.forEach(row => this.write_stream.write(row));
+            to_push.forEach(item => this.queue.push(item));
+
+            this.processed += to_write.length;
+            process.stdout.write(`Written: ${this.processed}. Pending: ${this.queue.length}\r`);
         }
     }
-}
 
-class SongFeaturesScraper extends MySpotify {
-    init_path(read_path, write_path) {
-        if (!fs.existsSync(read_path)) {
-            throw 'ASD';
+    async process(n) {
+        const promises = [];
+        for (let i = 0; i < n; i++) {
+            promises.push(this.consume_queue());
         }
-        let songs = [];
-        fs.createReadStream(read_path)
-            .pipe(parse({ delimiter: ',', columns: true }))
-            .on('data', row => {
-                songs.push(row.id);
-                if (songs.length == 50) {
-                    this.queue.add(async () => this.get_songs_features(songs));
-                    songs = [];
-                }
-            })
-            .on('end', () => {
-                if (songs.length > 0) {
-                    this.queue.add(async () => this.get_songs_features(songs));
-                }
-            });
-        const headers = ['id', 'danceability', 'energy', 'key', 'loudness', 'mode', 'speechiness', 'acousticness', 'instrumentalness', 'liveness', 'valence', 'tempo', 'time_signature'];
-        const stream = fs.createWriteStream(write_path, { flags: 'a' });
-        this.write_stream = stringify({
-            columns: headers,
-            header: true,
-        });
-        this.write_stream.pipe(stream);
-    }
-
-    async get_songs_features(songs) {
-        let response;
         try {
-            response = await this.getAudioFeaturesForTracks(songs);
+            await Promise.all(promises);
         }
         catch (error) {
-            if (error.statusCode == 429) {
-                if (this.timeout) {
-                    this.timeout.unref();
-                }
-                await this.queue.pause();
-                this.timeout = setTimeout(
-                    async () => await this.queue.start(),
-                    parseInt(error.headers['retry-after']) * 1000 + 500,
-                );
-            }
-            else if (error.statusCode == 401) {
-                await this.queue.pause();
-                await this.login();
-                await this.queue.start();
-            }
-            else {
-                console.log(error);
-            }
-            this.queue.add(async () => this.get_songs_features(songs));
-            return;
+            console.log(error);
+            console.log(`Processed: ${this.processed}. Pending: ${this.queue.length}`);
         }
-
-        response.body.audio_features.forEach(song => {
-            if (song) {
-                this.write_stream.write([
-                    song.id,
-                    song.danceability,
-                    song.energy,
-                    song.key,
-                    song.loudness,
-                    song.mode,
-                    song.speechiness,
-                    song.acousticness,
-                    song.instrumentalness,
-                    song.liveness,
-                    song.valence,
-                    song.tempo,
-                    song.time_signature,
-                ]);
-            }
-        });
-        this.processed += response.body.audio_features.length;
-        process.stdout.write(`Processed: ${this.processed}. Pending: ${this.queue.size}\r`);
     }
 }
 
-class SongScraper extends MySpotify {
-    init_path(read_path, write_path) {
-        if (!fs.existsSync(read_path)) {
-            throw 'ASD';
-        }
-        let albums = [];
-        const chunks = [];
-        fs.createReadStream(read_path)
-            .pipe(parse({ delimiter: ',', columns: true }))
-            .on('data', row => {
-                albums.push(row.id);
-                if (albums.length >= 20) {
-                    chunks.push(albums);
-                    albums = [];
-                }
-                process.stdout.write(chunks.length + '\r');
-            })
-            .on('end', async () => {
-                if (albums.length > 0) {
-                    chunks.push(albums);
-                }
-                let chunk;
-                while (chunks.length > 0) {
-                    chunk = chunks.pop();
-                    await this.queue.add(() => this.get_albums_songs(chunk));
-                }
-            });
-
-        const headers = ['id', 'name', 'album', 'artists', 'duration_ms', 'explicit', 'disc_number', 'track_number'];
-        const stream = fs.createWriteStream(write_path, { flags: 'a' });
-        this.write_stream = stringify({
-            columns: headers,
-            header: true,
-            cast: { boolean: x => (+x).toString() },
-        });
-        this.write_stream.pipe(stream);
-    }
-
-    write_track(track, album) {
-        const artists = track.artists.map(x => x.id);
-        this.write_stream.write([
-            track.id,
-            track.name,
-            album,
-            artists,
-            track.duration_ms,
-            track.explicit,
-            track.disc_number,
-            track.track_number,
-        ]);
-    }
-
-    async get_album_songs(album, offset) {
-        let response;
-        try {
-            response = await this.getAlbumTracks(album, { limit: 50, offset: offset });
-        }
-        catch (error) {
-            if (error.statusCode == 429) {
-                if (this.timeout) {
-                    this.timeout.unref();
-                }
-                await this.queue.pause();
-                this.timeout = setTimeout(
-                    async () => await this.queue.start(),
-                    parseInt(error.headers['retry-after']) * 1000 + 500,
-                );
-            }
-            else if (error.statusCode == 401) {
-                await this.queue.pause();
-                await this.login();
-                await this.queue.start();
-            }
-            else {
-                console.log(error);
-            }
-            await this.queue.add(async () => this.get_album_songs(album, offset));
-            return;
-        }
-        response.body.items.forEach(track => {
-            this.write_track(track, album);
-        });
-        if (response.body.next) {
-            await this.queue.add(async () => this.get_album_songs(album, offset + 50));
-        }
-        this.processed += response.body.items.length;
-        process.stdout.write(`Processed: ${this.processed}. Pending: ${this.queue.size}\r`);
-    }
-
-    async get_albums_songs(albums) {
-        let response;
-        try {
-            response = await this.getAlbums(albums);
-        }
-        catch (error) {
-            if (error.statusCode == 429) {
-                if (this.timeout) {
-                    this.timeout.unref();
-                }
-                await this.queue.pause();
-                this.timeout = setTimeout(
-                    async () => await this.queue.start(),
-                    parseInt(error.headers['retry-after']) * 1000 + 500,
-                );
-            }
-            else if (error.statusCode == 401) {
-                await this.queue.pause();
-                await this.login();
-                await this.queue.start();
-            }
-            else {
-                console.log(error);
-            }
-            await this.queue.add(async () => this.get_albums_songs(albums));
-            return;
-        }
-
-        response.body.albums.forEach(async album => {
-            album.tracks.items.forEach(track => {
-                this.write_track(track, album.id);
-            });
-            if (album.tracks.next) {
-                await this.queue.add(async () => this.get_album_songs(album.id, 50));
-            }
-            this.processed += album.tracks.items.length;
-        });
-        process.stdout.write(`Processed: ${this.processed}. Pending: ${this.queue.size}\r`);
-    }
-}
-
-class AlbumScraper extends MySpotify {
-    constructor(options) {
-        super(options);
-
-        this.query_callback = async popped => {
-            return await this.getArtistAlbums(
-                popped.id,
-                { limit: 50, offset: popped.offset, album_type: 'album,single' },
-            );
-        };
-
-        this.response_callback = async (response, popped) => {
-            if (response.body.next) {
-                this.queue.push({ id: popped.id, offset: popped.offset + 50 });
-            }
-
-            response.body.items.forEach(album => {
-                const artists = album.artists.map(x => x.id);
-                this.write_stream.write([
-                    album.id,
-                    album.name,
-                    artists,
-                    album.album_type,
-                    album.release_date,
-                    album.total_tracks,
-                    album.available_markets,
-                ]);
-                this.processed++;
-            });
-        };
-    }
-
-    async init_path(read_path, write_path) {
-        if (!fs.existsSync(read_path)) {
-            throw 'ASD';
-        }
-        const data = fs.readFileSync(read_path, 'utf8');
-        const artists = parse(data, { columns: true });
-        this.queue = artists.map(function(artist) {
-            return { id: artist.id, offset: 0 };
-        });
-        console.log('Done reading');
-
-        const headers = ['id', 'name', 'artists', 'type', 'release_date', 'total_tracks', 'markets'];
-        const stream = fs.createWriteStream(write_path, { flags: 'a' });
-        this.write_stream = stringify({ columns: headers, header: true });
-        this.write_stream.pipe(stream);
-        console.log('Done piping');
-    }
-}
 
 class ArtistScraper extends MySpotify {
     constructor(options) {
@@ -416,4 +203,4 @@ class ArtistScraper extends MySpotify {
     }
 }
 
-export { MySpotify, AlbumScraper, ArtistScraper, SongScraper, SongFeaturesScraper };
+export { MySpotify, ArtistScraper };

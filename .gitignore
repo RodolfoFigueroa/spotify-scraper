@@ -1,5 +1,5 @@
 *.csv
-backups/
+files/
 node_modules/
 .ipynb_checkpoints/
 .env
