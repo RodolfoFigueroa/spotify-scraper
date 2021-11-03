@@ -20,8 +20,11 @@ class MySpotify extends SpotifyWebApi {
     }
 
     async init_path(write_path, headers, options = null) {
-        const { read_path, row_callback, after_callback, pending } = options;
-        if (read_path) {
+        const { read_path, row_callback, after_callback, pending, queue } = options;
+        if (read_path && queue) {
+            throw 'Only one of read_path and queue should be nonempty.';
+        }
+        else if (read_path) {
             if (!fs.existsSync(read_path)) {
                 throw 'Read file doesn\'t exist.';
             }
@@ -46,6 +49,12 @@ class MySpotify extends SpotifyWebApi {
                 this.queue = this.queue.slice(0, pending);
             }
         }
+        else if (queue) {
+            this.queue = queue;
+        }
+        else {
+            throw 'One of read_path and init_callback should be nonempty';
+        }
 
         const stream = fs.createWriteStream(write_path, { flags: 'a' });
         this.write_stream = stringify({
@@ -57,6 +66,20 @@ class MySpotify extends SpotifyWebApi {
     }
 
     async consume_queue() {
+        let flag = true;
+        for (let i = 0; i < 3; i++) {
+            if (this.queue.length > 0) {
+                flag = false;
+                break;
+            }
+            else {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+        if (flag) {
+            console.log('asd');
+            return;
+        }
         while (this.queue.length > 0) {
             const popped = this.queue.pop();
             let response;
@@ -72,6 +95,7 @@ class MySpotify extends SpotifyWebApi {
                     this.login();
                 }
                 else if (error.statusCode == 400) {
+                    console.log('Error');
                     console.log(popped);
                     console.log(error.body);
                 }
@@ -93,6 +117,7 @@ class MySpotify extends SpotifyWebApi {
             this.processed += to_write.length;
             process.stdout.write(`Written: ${this.processed}. Pending: ${this.queue.length}\r`);
         }
+        console.log('asdd');
     }
 
     async process(n) {
@@ -110,97 +135,4 @@ class MySpotify extends SpotifyWebApi {
     }
 }
 
-
-class ArtistScraper extends MySpotify {
-    constructor(options) {
-        super(options);
-        this.artists = new Set();
-        this.pending_artists = new Set();
-    }
-
-    async init_path(path) {
-        if (!fs.existsSync(path)) {
-            const initial_artist = (await this.getArtist('0qeei9KQnptjwb8MgkqEoy')).body;
-            this.queue.add(async () => this.recursive_artists(initial_artist));
-        }
-        else {
-            const tentative_artists = new Set();
-            fs.createReadStream(path)
-                .pipe(parse({ delimiter: ',' }))
-                .on('data', row => {
-                    this.artists.add(row[0]);
-                    row[4].split(',').forEach(artist => {
-                        tentative_artists.add(artist);
-                    });
-                });
-            // const pending_artists = tentative_artists.forEach(artist => {
-            //     if (!this.artists.has(artist)) {
-            //         0;
-            //     }
-            // });
-        }
-        const headers = ['id', 'name', 'followers', 'genres', 'related_artists'];
-        const stream = fs.createWriteStream(path, { flags: 'a' });
-        this.write_stream = stringify({ columns: headers, header: true });
-        this.write_stream.pipe(stream);
-    }
-
-    async recursive_artists(artist_data) {
-        const root = artist_data.id;
-        if (this.artists.has(root)) {
-            return;
-        }
-        this.artists.add(root);
-
-        let response;
-        try {
-            response = (await this.getArtistRelatedArtists(root)).body.artists;
-        }
-        catch (error) {
-            this.artists.delete(root);
-            if (error.statusCode == 429) {
-                if (this.timeout) {
-                    this.timeout.unref();
-                }
-                await this.queue.pause();
-                this.timeout = setTimeout(
-                    async () => await this.queue.start(),
-                    parseInt(error.headers['retry-after']) * 1000 + 500,
-                );
-            }
-            else if (error.statusCode == 401) {
-                await this.queue.pause();
-                await this.login();
-                await this.queue.start();
-            }
-            else {
-                console.log(error);
-            }
-            this.queue.add(async () => this.recursive_artists(artist_data));
-            return;
-        }
-
-        const found_ids = response.map(artist => artist.id);
-        this.write_stream.write([
-            artist_data.id,
-            artist_data.name,
-            artist_data.followers.total,
-            artist_data.genres,
-            found_ids,
-        ]);
-
-        response.forEach(artist => {
-            if (!this.artists.has(artist.id) && !this.pending_artists.has(artist.id)) {
-                this.queue.add(async () => this.recursive_artists(artist));
-                this.pending_artists.add(artist.id);
-            }
-        });
-
-        this.pending_artists.delete(root);
-
-        this.processed++;
-        process.stdout.write(`Processed: ${this.processed}. Pending: ${this.queue.size}\r`);
-    }
-}
-
-export { MySpotify, ArtistScraper };
+export { MySpotify };

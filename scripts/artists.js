@@ -5,20 +5,21 @@ dotenv.config();
 const write_path = './artists2.csv';
 const headers = ['id', 'name', 'followers', 'genres', 'related_artists'];
 const seen_artists = new Set();
-const pending_artists = new Set();
 
 async function query_callback(popped) {
-    
-    return await this.getArtistRelatedArtists(popped);
+    if (!seen_artists.has(popped.id)) {
+        return await this.getArtistRelatedArtists(popped.id);
+    }
 }
 
 async function response_callback(response, popped) {
-    const related_ids = [];
     const to_write = [], to_push = [];
+    seen_artists.add(popped.id);
 
+    const related_ids = [];
     response.body.artists.forEach(artist => {
         related_ids.push(artist.id);
-        if (!seen_artists.has(artist.id) && !pending_artists.has(artist.id)) {
+        if (!seen_artists.has(artist.id)) {
             to_push.push(artist);
         }
     });
@@ -42,12 +43,14 @@ const spotify = new MySpotify(
     },
 );
 
-
 async function main() {
     await spotify.login();
+
+    const queue = [(await spotify.getArtist('53CQUfjaBNRwV2nFro1nac')).body];
     await spotify.init_path(
         write_path,
         headers,
+        { queue: queue },
     );
     await spotify.process(10);
     console.log('Done');
