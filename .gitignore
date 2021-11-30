@@ -4,3 +4,5 @@ node_modules/
 .ipynb_checkpoints/
 .env
 .eslintrc.json
+down.sh
+fig/
